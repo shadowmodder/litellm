@@ -26,13 +26,21 @@ _JSON_BODY: Final = TypeAdapter(dict[str, JsonValue])
 
 
 class _Bedrock:
-    def __init__(self, runtime: tuple[int, Mapping[str, object]], mantle: tuple[int, Mapping[str, object]]) -> None:
+    def __init__(
+        self,
+        runtime: tuple[int, Mapping[str, object]],
+        mantle: tuple[int, Mapping[str, object]],
+        mantle_error: bool = False,
+    ) -> None:
         self.runtime: Final = runtime
         self.mantle: Final = mantle
+        self.mantle_error: Final = mantle_error
         self.requests: tuple[httpx.Request, ...] = ()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests = (*self.requests, request)
+        if request.url.host != RUNTIME_HOST and self.mantle_error:
+            raise httpx.ConnectError("Name or service not known", request=request)
         status_code, body = self.runtime if request.url.host == RUNTIME_HOST else self.mantle
         return httpx.Response(status_code, json=dict(body), request=request)
 
@@ -191,6 +199,47 @@ async def test_runtime_400_without_an_edit_still_reports_the_mantle_failure() ->
     assert result.status_code == 404
     assert result.tokenizer_type == "bedrock_mantle_api"
     assert "does not exist" in (result.error_message or "")
+    assert bedrock.posted_hosts() == (RUNTIME_HOST, MANTLE_HOST)
+
+
+@pytest.mark.asyncio
+async def test_mantle_connection_failure_keeps_the_runtime_rejection() -> None:
+    bedrock: Final = _Bedrock(runtime=(400, UNSUPPORTED), mantle=(200, {"input_tokens": 2177}), mantle_error=True)
+
+    result: Final = await _counter(bedrock).count_tokens(
+        model_to_use="global.anthropic.claude-opus-4-8",
+        messages=MESSAGES,
+        contents=None,
+        deployment=DEPLOYMENT,
+        request_model="claude-opus-4-8",
+    )
+
+    assert result is not None
+    assert result.error is True
+    assert result.status_code == 400
+    assert result.tokenizer_type == "bedrock_api"
+    assert "doesn't support counting tokens" in (result.error_message or "")
+    assert bedrock.posted_hosts() == (RUNTIME_HOST, MANTLE_HOST, MANTLE_HOST)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mantle_status", (500, 502, 503))
+async def test_mantle_5xx_keeps_the_runtime_rejection(mantle_status: int) -> None:
+    bedrock: Final = _Bedrock(runtime=(400, UNSUPPORTED), mantle=(mantle_status, {"message": "upstream unavailable"}))
+
+    result: Final = await _counter(bedrock).count_tokens(
+        model_to_use="global.anthropic.claude-opus-4-8",
+        messages=MESSAGES,
+        contents=None,
+        deployment=DEPLOYMENT,
+        request_model="claude-opus-4-8",
+    )
+
+    assert result is not None
+    assert result.error is True
+    assert result.status_code == 400
+    assert result.tokenizer_type == "bedrock_api"
+    assert "doesn't support counting tokens" in (result.error_message or "")
     assert bedrock.posted_hosts() == (RUNTIME_HOST, MANTLE_HOST)
 
 
